@@ -12,7 +12,10 @@
 #include "CycleTimer.h"
 
 
+#define THREADS 256
+
 extern float toBW(int bytes, float sec);
+
 
 
 /* Helper function to round up to a power of 2.
@@ -29,6 +32,28 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void chunkSumKernel(int *data, int len, int i) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  int dest = (idx + 1) * i - 1;
+  if (dest < len) {
+    data[dest] += data[dest - i / 2];
+  }
+}
+
+
+
+__global__ void addPrevKernel(int *data, int len, int i) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  int dest = (idx + 1) * i - 1;
+  if (dest < len) {
+    int src = dest - i / 2;
+    int tmp = data[dest];
+    data[dest] += data[src];
+    data[src] = tmp;
+  }
+}
+
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +68,19 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+
+    int len = nextPow2(length);
+    for (int i = 2; i < len; i <<= 1) {
+      int threads_needed = len / i;
+      chunkSumKernel<<<threads_needed / THREADS, THREADS>>>(device_data, len, i);
+    }
+    int value = 0;
+    cudaMemcpy(device_data + (len - 1), &value, sizeof(int),
+               cudaMemcpyHostToDevice);
+    for (int i = len; i > 1; i >>= 1) {
+      int threads_needed = len / i;
+      addPrevKernel<<<threads_needed / THREADS, THREADS>>>(device_data, len, i);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -109,6 +147,24 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void findPeaksKernel(int *input, int *output, int len) {
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;
+  int pos = idx + 1;
+  if (pos < len - 1) {
+    output[pos] = (input[pos] > input[pos - 1]) && (input[pos] > input[pos + 1]);
+  }
+}
+
+
+__global__ void place2startKernel(int *input, int* output, int len) {
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;
+  int pos = idx + 1;
+  if (pos < len - 1 && input[pos] != input[pos + 1]) {
+    output[input[pos]] = pos;
+  }
+}
+
+
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,7 +181,21 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+
+    findPeaksKernel<<<(length + THREADS - 1) / THREADS, THREADS>>>(
+        device_input, device_output, length);
+
+    exclusive_scan(device_output, length);
+
+    place2startKernel<<<(length + THREADS - 1) / THREADS, THREADS>>>(
+        device_output, device_input, length);
+
+    int ret = 0;
+    cudaMemcpy(&ret, device_output + (length - 1), sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(device_output, device_input, sizeof(int) * ret,
+               cudaMemcpyDeviceToDevice);
+    return ret;
 }
 
 
